@@ -20,6 +20,8 @@ struct StarAbsoluteRVLikelihood{TTable<:Table,GP} <: Octofitter.AbstractLikeliho
     table::TTable
     instrument_names::Vector{String}
     gaussian_process::GP
+    offset_symbols::Vector{Symbol}
+    jitter_symbols::Vector{Symbol}
     function StarAbsoluteRVLikelihood(observations...; instrument_names=nothing, gaussian_process=nothing)
         table = Table(observations...)
         if !issubset(rv_cols, Tables.columnnames(table))
@@ -36,7 +38,12 @@ struct StarAbsoluteRVLikelihood{TTable<:Table,GP} <: Octofitter.AbstractLikeliho
         if isnothing(instrument_names)
             instrument_names = string.(1:maximum(table.inst_idx))
         end
-        return new{typeof(table),typeof(gaussian_process)}(table, instrument_names, gaussian_process)
+
+        # Pre-allocate symbols for offset and jitter term access
+        offset_symbols = [Symbol("rv0_", i) for i in eachindex(instrument_names)]
+        jitter_symbols = [Symbol("jitter_", i) for i in eachindex(instrument_names)]
+
+        return new{typeof(table),typeof(gaussian_process)}(table, instrument_names, gaussian_process, offset_symbols, jitter_symbols)
     end
 end
 StarAbsoluteRVLikelihood(observations::NamedTuple...;kwargs...) = StarAbsoluteRVLikelihood(observations; kwargs...)
@@ -49,38 +56,18 @@ function Octofitter.ln_like(
     rvlike::StarAbsoluteRVLikelihood,
     θ_system,
     planet_orbits::NTuple{N,<:AbstractOrbit},
-    num_epochs::Val{L}=Val(length(rvlike.table))
-) where {L,N}
+    num_epochs::Val{L}=Val(length(rvlike.table)),
+    num_inst::Val{NI}=Val(length(rvlike.instrument_names))
+) where {L,N,NI}
+#) where {L,N}
     T = typeof(first(θ_system))
     ll = zero(T)
 
     # Each RV instrument index can have it's own barycentric RV offset and jitter.
-    # We support up to 10 insturments. Grab the offsets (if defined) and store in 
-    # a tuple. Then we can index by inst_idxs to look up the right offset and jitter.
-    barycentric_rv_inst = (
-        hasproperty(θ_system, :rv0_1) ? θ_system.rv0_1 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_2) ? θ_system.rv0_2 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_3) ? θ_system.rv0_3 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_4) ? θ_system.rv0_4 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_5) ? θ_system.rv0_5 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_6) ? θ_system.rv0_6 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_7) ? θ_system.rv0_7 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_8) ? θ_system.rv0_8 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_9) ? θ_system.rv0_9 : convert(T, NaN),
-        hasproperty(θ_system, :rv0_10) ? θ_system.rv0_10 : convert(T, NaN),
-    )
-    jitter_inst = (
-        hasproperty(θ_system, :jitter_1) ? θ_system.jitter_1 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_2) ? θ_system.jitter_2 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_3) ? θ_system.jitter_3 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_4) ? θ_system.jitter_4 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_5) ? θ_system.jitter_5 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_6) ? θ_system.jitter_6 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_7) ? θ_system.jitter_7 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_8) ? θ_system.jitter_8 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_9) ? θ_system.jitter_9 : convert(T, NaN),
-        hasproperty(θ_system, :jitter_10) ? θ_system.jitter_10 : convert(T, NaN),
-    )
+    # Grab the offsets/jitters and store in a tuple. 
+    # Then we can index by inst_idxs to look up the right offset and jitter.
+    barycentric_rv_inst = SVector{NI, T}(getproperty(θ_system, rvlike.offset_symbols[i]) for i in 1:NI)
+    jitter_inst = SVector{NI, T}(getproperty(θ_system, rvlike.jitter_symbols[i]) for i in 1:NI)
     max_inst_idx = maximum(rvlike.table.inst_idx)
 
     # Vector of radial velocity of the star at each epoch. Go through and sum up the influence of
