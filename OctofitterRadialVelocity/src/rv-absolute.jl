@@ -16,12 +16,12 @@ Represents a likelihood function of relative astometry between a host star and a
 be fit with different zero points and jitters.
 In addition to the example above, any Tables.jl compatible source can be provided.
 """
-struct StarAbsoluteRVLikelihood{TTable<:Table,GP} <: Octofitter.AbstractLikelihood
+struct StarAbsoluteRVLikelihood{TTable<:Table,GP,TOffsets,TJitters} <: Octofitter.AbstractLikelihood
     table::TTable
     instrument_names::Vector{String}
     gaussian_process::GP
-    offset_symbols::Vector{Symbol}
-    jitter_symbols::Vector{Symbol}
+    offset_symbols::TOffsets
+    jitter_symbols::TJitters
     function StarAbsoluteRVLikelihood(observations...; instrument_names=nothing, gaussian_process=nothing)
         table = Table(observations...)
         if !issubset(rv_cols, Tables.columnnames(table))
@@ -40,10 +40,10 @@ struct StarAbsoluteRVLikelihood{TTable<:Table,GP} <: Octofitter.AbstractLikeliho
         end
 
         # Pre-allocate symbols for offset and jitter term access
-        offset_symbols = [Symbol("rv0_", i) for i in eachindex(instrument_names)]
-        jitter_symbols = [Symbol("jitter_", i) for i in eachindex(instrument_names)]
+        offset_symbols = Tuple(Symbol("rv0_", i) for i in eachindex(instrument_names))
+        jitter_symbols = Tuple(Symbol("jitter_", i) for i in eachindex(instrument_names))
 
-        return new{typeof(table),typeof(gaussian_process)}(table, instrument_names, gaussian_process, offset_symbols, jitter_symbols)
+        return new{typeof(table),typeof(gaussian_process), typeof(offset_symbols), typeof(jitter_symbols)}(table, instrument_names, gaussian_process, offset_symbols, jitter_symbols)
     end
 end
 StarAbsoluteRVLikelihood(observations::NamedTuple...;kwargs...) = StarAbsoluteRVLikelihood(observations; kwargs...)
@@ -56,18 +56,16 @@ function Octofitter.ln_like(
     rvlike::StarAbsoluteRVLikelihood,
     θ_system,
     planet_orbits::NTuple{N,<:AbstractOrbit},
-    num_epochs::Val{L}=Val(length(rvlike.table)),
-    num_inst::Val{NI}=Val(length(rvlike.instrument_names))
-) where {L,N,NI}
-#) where {L,N}
+    num_epochs::Val{L}=Val(length(rvlike.table))
+) where {L,N}
     T = typeof(first(θ_system))
     ll = zero(T)
 
     # Each RV instrument index can have it's own barycentric RV offset and jitter.
     # Grab the offsets/jitters and store in a tuple. 
     # Then we can index by inst_idxs to look up the right offset and jitter.
-    barycentric_rv_inst = SVector{NI, T}(getproperty(θ_system, rvlike.offset_symbols[i]) for i in 1:NI)
-    jitter_inst = SVector{NI, T}(getproperty(θ_system, rvlike.jitter_symbols[i]) for i in 1:NI)
+    barycentric_rv_inst = SVector{length(rvlike.offset_symbols), T}(getproperty(θ_system, symbol) for symbol in rvlike.offset_symbols)
+    jitter_inst = SVector{length(rvlike.jitter_symbols), T}(getproperty(θ_system, symbol) for symbol in rvlike.jitter_symbols)
     max_inst_idx = maximum(rvlike.table.inst_idx)
 
     # Vector of radial velocity of the star at each epoch. Go through and sum up the influence of
