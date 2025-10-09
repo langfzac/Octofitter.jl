@@ -2,75 +2,96 @@ using KroneckerProductKernels
 
 const rv_2d_cols = (:epoch, :wavelength, :order, :rv)
 
-struct StarAbsolute2DRVLikelihood{TTable<:Table, GP, TF, OS, JS, ET, WT, XT} <: Octofitter.AbstractLikelihood
+struct StarAbsolute2DRVLikelihood{TTable<:Table, GP, TF, ET, WT, XT} <: Octofitter.AbstractLikelihood
     table::Table
-    instrument_name::String
+    priors::Octofitter.Priors
+    derived::Octofitter.Derived
+    held_out_table::TTable
+    name::String
     gaussian_process::GP
     trend_function::TF
-    offset_symbol::OS
-    jitter_symbol::JS
     epochs::ET
     wavelengths::WT
-    X ::XT
-    function StarAbsolute2DRVLikelihood(
-        observations...; 
-        offset,
-        jitter,
-        trend_function = (θ_system, epoch) -> zero(Octofitter._system_number_type(θ_system)),
-        instrument_name="", 
-        gaussian_process=nothing
-    )
-        table = Table(observations...)
-        if !issubset(rv_2d_cols, Tables.columnnames(table))
-            error("Expected columns $rv_2d_cols")
-        end
-        rows = map(eachrow(table)) do row′
-            row = (;row′[1]..., rv=float(row′[1].rv[1]))
-            return row
-        end
-        table = Table(rows)
-        
-        # Sort by order, then epoch
-        #df = table |> DataFrame
-        #sort!(df, [order(:wavelength), order(:epoch)])
-        #table = df |> Table
-        table = sort(table, by=x->(x.wavelength, x.epoch))
-
-        epochs = Tuple(unique(table.epoch))
-        wavelengths = Tuple(unique(table.wavelength))
-        X = RowVecs(vcat([[λ t] for (λ,t) in zip(table.wavelength, table.epoch)]...)) # Input for GP evaluation
-
-        # Offset and jitter symbols
-        # Assumes each order's symbols just have an "_i" appended in numerical order
-        offsets = Symbol.(Tuple("$(offset)_" .* string.(collect(1:length(wavelengths)))))
-        jitters = Symbol.(Tuple("$(jitter)_" .* string.(collect(1:length(wavelengths)))))
-
-        return new{typeof(table), typeof(gaussian_process), typeof(trend_function), typeof(offsets), typeof(jitters), typeof(epochs), typeof(wavelengths), typeof(X)}(table, instrument_name, gaussian_process, trend_function, offsets, jitters, epochs, wavelengths, X)
-    end
+    X::XT
 end
-StarAbsolute2DRVLikelihood(observations::NamedTuple...;kwargs...) = StarAbsolute2DRVLikelihood(observations; kwargs...)
-function Octofitter.likeobj_from_epoch_subset(obs::StarAbsolute2DRVLikelihood, obs_inds)
-    return StarAbsolute2DRVLikelihood(
-        obs.table[obs_inds,:,1]...;
-        offset_symbol=obs.offset_symbol,
-        jitter_symbol=obs.jitter_symbol,
-        trend_function=obs.trend_function,
-        instrument_name=obs.instrument_name,
-        gaussian_process=obs.gaussian_process,
+function StarAbsolute2DRVLikelihood(
+    observations;
+    variables::Union{Nothing, Tuple{Octofitter.Priors, Octofitter.Derived}}=nothing, 
+    trend_function = (θ_obs, epoch) -> zero(Octofitter._system_number_type(θ_obs)),
+    name::String,
+    gaussian_process=nothing
+)
+    (priors,derived)=variables
+
+    table = Table(observations)[:,:,1]
+    if !Octofitter.equal_length_cols(table)
+        error("The columns in the input data do not all have the same length")
+    end
+    if !issubset(rv_2d_cols, Tables.columnnames(table))
+        error("Expected columns $rv_2d_cols")
+    end
+    rows = map(eachrow(table)) do row′
+        row = (;row′[1]..., rv=float(row′[1].rv[1]))
+        return row
+    end
+    table = Table(rows)
+    
+    if any(>=(mjd("2050")),  table.epoch) || any(<=(mjd("1950")),  table.epoch)
+        @warn "The data you entered fell outside the range year 1950 to year 2050. The expected input format is MJD (modified julian date). We suggest you double check your input data!"
+    end
+
+    # Sort by order, then epoch
+    table = sort(table, by=x->(x.wavelength, x.epoch))
+
+    epochs = Tuple(unique(table.epoch))
+    wavelengths = Tuple(unique(table.wavelength))
+    X = RowVecs(vcat([[λ t] for (λ,t) in zip(table.wavelength, table.epoch)]...)) # Input for GP evaluation
+
+    # We need special book keeping for computing cross-validataion scores
+    # We keep a table of "held out" data if needed for that purpose.
+    # Here we leave it empty.
+    held_out_table = empty(table)
+
+    return StarAbsolute2DRVLikelihood{typeof(table), typeof(gaussian_process), typeof(trend_function), typeof(epochs), typeof(wavelengths), typeof(X)}(
+        table, priors, derived, held_out_table, name, gaussian_process, trend_function, epochs, wavelengths, X
     )
 end
 export StarAbsolute2DRVLikelihood
 
-function _getparams(rvlike::StarAbsolute2DRVLikelihood{TTable, GP, TF, OS, JS, ET, WT, XT}, θ_system) where {TTable, GP, TF, OS, JS, ET, WT, XT}
-    offsets = [getproperty(θ_system, sym) for sym in rvlike.offset_symbol]
-    jitters = [getproperty(θ_system, sym) for sym in rvlike.jitter_symbol]
-    return (;offsets, jitters)
+# In-place simulation logic for StarAbsolute2DRVLikelihood (performance-critical)
+function Octofitter.simulate!(rv_model_buf, rvlike::StarAbsolute2DRVLikelihood,  θ_system, θ_obs, planet_orbits::Tuple, orbit_solutions, orbit_solutions_i_epoch_start)
+    L = length(rvlike.epochs)
+
+    # Compute the model RV values (what we expect to observe)
+    rv_model_buf .= rvlike.trend_function.(Ref(θ_obs), rvlike.epochs)
+
+    # Add RV constribution from all planets:
+    for planet_i in eachindex(planet_orbits)
+        orbit = planet_orbits[planet_i]
+        planet_mass = θ_system.planets[planet_i].mass
+        for epoch_i in eachindex(rvlike.epochs)
+            rv_model_buf[epoch_i] += radvel(
+                orbit_solutions[planet_i][epoch_i+orbit_solutions_i_epoch_start],
+                planet_mass*Octofitter.mjup2msol
+            )
+        end
+    end
+
+    return (rv_model = rv_model_buf, epochs = rvlike.epochs)
 end
 
+# Allocating simulation logic for StarAbsoluteRVLikelihood (convenience method)
+function Octofitter.simulate(rvlike::StarAbsolute2DRVLikelihood, θ_system, θ_obs, planet_orbits::Tuple, orbit_solutions, orbit_solutions_i_epoch_start)
+    T = Octofitter._system_number_type(θ_system)
+    L = length(rvlike.epochs)
+    rv_model_buf = Vector{T}(undef, L)
+    return Octofitter.simulate!(rv_model_buf, rvlike, θ_system, θ_obs, planet_orbits, orbit_solutions, orbit_solutions_i_epoch_start)
+end
 
 function Octofitter.ln_like(
     rvlike::StarAbsolute2DRVLikelihood,
     θ_system,
+    θ_obs,
     planet_orbits::Tuple,
     orbit_solutions,
     orbit_solutions_i_epoch_start
@@ -80,51 +101,31 @@ function Octofitter.ln_like(
     T = Octofitter._system_number_type(θ_system)
     ll = zero(T)
 
-    # Get offset and jitter values from the input
-    #offsets = getproperty.(Ref(θ_system), rvlike.offset_symbol)
-    #jitters = getproperty.(Ref(θ_system), rvlike.jitter_symbol)
-    #(;offsets, jitters) = _getparams(rvlike, θ_system)
-
     @no_escape begin
         # pre allocate arrays N epochs x N orders
-        rv_buf = @alloc(T, LE, LO)
-        offsets = @alloc(T, LO)
-        jitters = @alloc(T, LO)
+        rv_model_buf = @alloc(T, LE, LO)
+        rv_residuals = @alloc(T, LE*LO)
+        rv_bary_buf = @alloc(T, LE)
 
-        # Get the offsets and jitters
-        for i in eachindex(offsets)
-            offsets[i] = getproperty(θ_system, rvlike.offset_symbol[i])
-            jitters[i] = getproperty(θ_system, rvlike.jitter_symbol[i])
-        end
+        # Use in-place simulation method to get model values
+        sim = Octofitter.simulate!(rv_bary_buf, rvlike, θ_system, θ_obs, planet_orbits, orbit_solutions, orbit_solutions_i_epoch_start)
+        rv_model_buf .= rv_bary_buf # Broadcast across each column
 
-        # rv data - offset - trend (if any)
-        @views rv_buf[:] .= rvlike.table.rv
-        for i in eachindex(offsets)
-            @views rv_buf[:, i] .-= offsets[i] # .- rvlike.trend_function(θ_system, rvlike.table.epoch)
-        end
+        # Compute residuals
+        rv_residuals .= rvlike.table.rv .- vec(rv_model_buf) # Flatten buffer
 
-        # Now get the barycentric rv at each epoch
-        # Assumes data is sorted by order first, then epoch
-        for planet_i in eachindex(planet_orbits)
-            planet_mass = θ_system.planets[planet_i].mass
-            for epoch_i in eachindex(rvlike.epochs)
-                @views rv_buf[epoch_i, :] .-= radvel(
-                    orbit_solutions[planet_i][epoch_i+orbit_solutions_i_epoch_start],
-                    planet_mass*Octofitter.mjup2msol
-                )
-            end
-        end
-
-        # Assume each jitter term is the diagonal of Σλ
-        local gp
-        try 
-            gp = @inline rvlike.gaussian_process(θ_system)
+        # Compute the 2D GP
+        local gp, fx
+        try
+            gp = @inline rvlike.gaussian_process(θ_obs)
+            fx = gp(rvlike.X, θ_obs.σ_data^2)
         catch err
-            if err isa PosDefException
-                @warn "err" exception=(err, catch_backtrace()) maxlog=1
+            @info "bad gp: " θ_obs
+            if err isa DomainError
+                ll = convert(T, -Inf)
+            elseif err isa PosDefException
                 ll = convert(T, -Inf)
             elseif err isa ArgumentError
-                @warn "err" exception=(err, catch_backtrace()) maxlog=1
                 ll = convert(T, -Inf)
             else
                 rethrow(err)
@@ -132,11 +133,16 @@ function Octofitter.ln_like(
         end
 
         if isfinite(ll)
-            Σy = KroneckerProductKernels.:⊗(Diagonal(collect(jitters.^2)), Diagonal(ones(T, LE)))
-            fx = gp(rvlike.X, Σy)
             try
-                ll += logpdf(fx, vec(rv_buf))
+                # Normal path: evaluate likelihood against all data
+                if isempty(rvlike.held_out_table)
+                    ll += logpdf(fx, vec(rv_model_buf))
+                else
+                    # Implement cross validation later...
+                    throw(NotImplementedException())
+                end
             catch err
+                @info "bad ll: " θ_obs
                 if err isa PosDefException || err isa DomainError
                     @warn "err" exception=(err, catch_backtrace()) θ_system
                     ll = convert(T, -Inf)
@@ -146,10 +152,11 @@ function Octofitter.ln_like(
             end
         end
     end
+    ll isa Float64 ? (@info "Internal ll: " ll) : nothing
     return ll
 end
 
-function Octofitter.generate_from_params(like::StarAbsolute2DRVLikelihood, θ_system, orbits::Vector{<:RadialVelocityOrbit})
+#=function Octofitter.generate_from_params(like::StarAbsolute2DRVLikelihood, θ_system,  θ_obs, orbits, orbit_solutions, orbit_solutions_i_epoch_start; add_noise)
     epochs = like.table.epoch
     orders = like.table.order
     wavelengths = like.table.wavelength
@@ -171,4 +178,4 @@ function Octofitter.generate_from_params(like::StarAbsolute2DRVLikelihood, θ_sy
     radvel_table = Table(epoch=epochs, rv=rvs[:], order=orders, wavelength=wavelengths)    
 
     return StarAbsolute2DRVLikelihood(radvel_table)
-end
+end=#
