@@ -70,9 +70,9 @@ hipparcos_catalog_orbit_parameters_used = [
 ]
 
 ###########################
-# Stores data:
+# Stores observations data:
 const hip_iad_cols = (:iorb, :epoch, :parf, :cosϕ, :sinϕ, :res, :sres)
-struct HipparcosIADLikelihood{THipSol,TIADTable<:Table,TDist,TFact} <: AbstractLikelihood
+struct HipparcosIADObs{THipSol,TIADTable<:Table,TDist,TFact} <: AbstractObs
     hip_sol::THipSol
     table::TIADTable
     priors::Priors
@@ -84,40 +84,49 @@ struct HipparcosIADLikelihood{THipSol,TIADTable<:Table,TDist,TFact} <: AbstractL
     A_prepared_5::TFact
 end
 
-# Add likelihoodname method
-likelihoodname(::HipparcosIADLikelihood) = "Hipparcos IAD"
+# Backwards compatibility alias
+const HipparcosIADLikelihood = HipparcosIADObs
 
-function likeobj_from_epoch_subset(obs::HipparcosIADLikelihood, obs_inds)
-    return HipparcosIADLikelihood(obs.hip_sol, obs.table[obs_inds, :, 1], obs.priors, obs.derived, obs.name, obs.dist, obs.A_prepared_4, obs.A_prepared_5)
+# Add likelihoodname method
+likelihoodname(::HipparcosIADObs) = "Hipparcos IAD"
+
+function likeobj_from_epoch_subset(obs::HipparcosIADObs, obs_inds)
+    return HipparcosIADObs(obs.hip_sol, obs.table[obs_inds, :, 1], obs.priors, obs.derived, obs.name, obs.dist, obs.A_prepared_4, obs.A_prepared_5)
 end
 
 """
-    HipparcosIADLikelihood(;
+    HipparcosIADObs(;
         hip_id,
         variables=@variables begin
-            fluxratio ~ Product([Uniform(0, 1), Uniform(0, 1)])  # one entry for each companion
+            fluxratio_hip ~ Product([Uniform(0, 1), Uniform(0, 1)])  # one entry for each companion (Hp band)
         end
     )
 
-Load the Hipparcos IAD likelihood.
+Load the Hipparcos IAD observations.
 By default, this fetches and catches the extracted Java Tool edition of the
-van Leeuwan reduction. 
+van Leeuwan reduction.
 
-The `fluxratio` variable should be a Product distribution containing the flux ratio of each companion
-in the same order as the planets in the system.
+The Hipparcos abscissa likelihood applies the BINARYS atan2 photocentre formula
+and per-transit first-harmonic σ inflation (Leclerc et al. 2023, A&A 672 A82,
+Eq. 13 + Eq. 15).
+
+The `fluxratio_hip` variable is **required** and must be a Product distribution
+containing the Hp-band flux ratio of each companion in the same order as the
+planets in the system. (Note: distinct from `fluxratio`, which is the G-band
+ratio used by the Gaia DR2/DR3 photocentre branch in `G23HObs`.)
 
 Additional arguments:
 * `catalog`: path to the data directory. By default, will fetch from online and cache.
 * `renormalize=true`: renormalize the uncertainties according to Nielsen et al. (2020)
 * `attempt_correction=true`: perform ad-hoc correction of any corrupted scans according to G. Brandt et al. (2021)
 * `is_van_leeuwen=true`: set to false if using e.g. the 1997 reduction.
-    This impacts how the residuals are reconstructed. The 1997 version applied a time varying 
+    This impacts how the residuals are reconstructed. The 1997 version applied a time varying
     parallax to high RV stars, while the van Leeuwan reduction did not. The van Leeuwan reduction
     residuals are relative to the 7 or 9 parameter model (when applicable) while the 1997 version
-    is always relative to the 5 parameter solution, even when higher order terms are reported.  
+    is always relative to the 5 parameter solution, even when higher order terms are reported.
 
 """
-function HipparcosIADLikelihood(;
+function HipparcosIADObs(;
         hip_id,
         catalog=(datadep"Hipparcos_IAD"),
         renormalize=true,
@@ -363,6 +372,13 @@ function HipparcosIADLikelihood(;
         (table.x * cosd(α₀) * sind(δ₀) + table.y * sind(α₀) * sind(δ₀) - table.z * cosd(δ₀)) * table.sinϕ
     )
 
+    # Per-epoch scan-projected measured abscissa: hot path in g23h IAD
+    # residual loop reads this as a single column instead of recomputing
+    # `res + Δα✱·cosϕ + Δδ·sinϕ` (3 reads + 2 muls + 2 adds → 1 read).
+    # Identity follows from α✱ₐ = res·cosϕ + Δα✱, δₐ = res·sinϕ + Δδ, and
+    # cos²ϕ + sin²ϕ = 1.
+    table.proj_meas_alongscan = @. table.res + table.Δα✱ * table.cosϕ + table.Δδ * table.sinϕ
+
     table = Table(table)
 
     # Prepare some matrices for linear system solves
@@ -370,9 +386,9 @@ function HipparcosIADLikelihood(;
     A_prepared_5 = prepare_A_5param(table, ref_epoch_ra, ref_epoch_dec)
 
 
-    return HipparcosIADLikelihood(hip_sol, table, priors, derived, "Hipparcos IAD", dist, A_prepared_4, A_prepared_5)
+    return HipparcosIADObs(hip_sol, table, priors, derived, "Hipparcos IAD", dist, A_prepared_4, A_prepared_5)
 end
-export HipparcosIADLikelihood
+export HipparcosIADObs, HipparcosIADLikelihood
 
 
 """
@@ -517,30 +533,29 @@ end
 
 
 ##########################
-# Computes likelihood
-function ln_like(
-    hiplike::HipparcosIADLikelihood,
-    θ_system,
-    θ_obs,
-    orbits,
-    orbit_solutions,
-    sol_start_i
-)
+# Computes log-likelihood
+function ln_like(obs::HipparcosIADObs, ctx::PlanetObservationContext)
+    (; θ_system, θ_planet, θ_obs, orbits, orbit_solutions, i_planet, orbit_solutions_i_epoch_start) = ctx
+
     T = _system_number_type(θ_system)
     ll = zero(T)
 
-    hip_model = simulate(hiplike, θ_system, θ_obs, orbits, orbit_solutions, sol_start_i)
+    # Use the first element of orbit_solutions_i_epoch_start for compatibility
+    sol_start_i = first(orbit_solutions_i_epoch_start)
+    hip_model = simulate(obs, θ_system, θ_obs, orbits, orbit_solutions, sol_start_i)
     for i in eachindex(hip_model.resid)
-        if hiplike.table.reject[i]
+        if obs.table.reject[i]
             continue
         end
-        ll += logpdf(Normal(0, hiplike.table.sres_renorm[i]), hip_model.resid[i])
+        # σ inflated by BINARYS first-harmonic factor (Leclerc et al. 2023, Eq. 15).
+        ll += logpdf(Normal(0, obs.table.sres_renorm[i] * hip_model.σ_inflation[i]),
+                     hip_model.resid[i])
     end
 
     return ll
 end
 
-function simulate(hiplike::HipparcosIADLikelihood, θ_system, θ_obs, orbits, orbit_solutions, orbit_solutions_i_epoch_start)
+function simulate(hiplike::HipparcosIADObs, θ_system, θ_obs, orbits, orbit_solutions, orbit_solutions_i_epoch_start)
 
     T = _system_number_type(θ_system)
     α✱_model_with_perturbation_out = zeros(T, length(hiplike.table.epoch))
@@ -554,37 +569,37 @@ function simulate(hiplike::HipparcosIADLikelihood, θ_system, θ_obs, orbits, or
         for i in eachindex(orbits)[2:end]
             if orbits[i].ra != orbit.ra ||
                orbits[i].dec != orbit.dec ||
-               orbits[i].pmra != orbit.rpma ||
-               orbits[i].pmdec != orbit.ra
-                pmdec
-                error("Planet orbits do not have matching ra, dec, pmpra, and pmdec.")
+               orbits[i].pmra != orbit.pmra ||
+               orbits[i].pmdec != orbit.pmdec
+                error("Planet orbits do not have matching ra, dec, pmra, and pmdec.")
             end
         end
     end
 
-    # Pre-compute perturbations from all planets for all epochs using standardized function
+    # Pre-compute perturbations from all planets for all epochs.
+    # The Hipparcos abscissa likelihood always uses the BINARYS atan2 photocentre
+    # formula; the multi-source modulated signal is computed jointly across all
+    # companions in a single pass (Leclerc et al. 2023, A&A 672 A82, Eq. 13 + Eq. 15).
     α✱_perturbations_total = zeros(T, length(hiplike.table.epoch))
     δ_perturbations_total = zeros(T, length(hiplike.table.epoch))
-    
-    for planet_i in eachindex(orbits)
-        planet_mass_msol = θ_system.planets[planet_i].mass * Octofitter.mjup2msol
-        fluxratio = hasproperty(θ_obs, :fluxratio) ? θ_obs.fluxratio[planet_i] : zero(T)
-        
-        # Create temporary arrays for this planet's contribution
-        Δα_mas = zeros(T, length(hiplike.table.epoch))
-        Δδ_mas = zeros(T, length(hiplike.table.epoch))
-        
-        _simulate_skypath_perturbations!(
-            Δα_mas, Δδ_mas,
-            hiplike.table, orbits[planet_i],
-            planet_mass_msol, fluxratio,
-            orbit_solutions[planet_i], orbit_solutions_i_epoch_start[planet_i], T
-        )
-        
-        # Add this planet's contribution to total perturbations
-        α✱_perturbations_total .+= Δα_mas
-        δ_perturbations_total .+= Δδ_mas
+    σ_inflation_hip = ones(T, length(hiplike.table.epoch))
+
+    n_planets = length(orbits)
+    planet_masses_msol = ntuple(i -> θ_system.planets[i].mass * Octofitter.mjup2msol, n_planets)
+    flux_ratios_hip = ntuple(n_planets) do i
+        θ_obs.fluxratio_hip isa Number ? θ_obs.fluxratio_hip : θ_obs.fluxratio_hip[i]
     end
+    # `orbit_solutions_i_epoch_start` is a scalar Int shared across planets;
+    # broadcast to a per-planet tuple for the combined Hippacentre routine.
+    orbit_sol_starts = ntuple(_ -> orbit_solutions_i_epoch_start, n_planets)
+
+    _simulate_skypath_hippacentre_combined!(
+        α✱_perturbations_total, δ_perturbations_total, σ_inflation_hip,
+        hiplike.table,
+        orbits, planet_masses_msol, flux_ratios_hip,
+        orbit_solutions, orbit_sol_starts, T,
+        HIPPARCOS_GRID_STEP_ARCSEC,
+    )
 
     for i in eachindex(hiplike.table.epoch)
 
@@ -687,7 +702,8 @@ function simulate(hiplike::HipparcosIADLikelihood, θ_system, θ_obs, orbits, or
     return (;
         α✱_model_with_perturbation=α✱_model_with_perturbation_out,
         δ_model_with_perturbation=δ_model_with_perturbation_out,
-        resid=resid_out
+        resid=resid_out,
+        σ_inflation=σ_inflation_hip,
     )
 end
 

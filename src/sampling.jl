@@ -6,6 +6,7 @@ using Transducers
 using CovarianceEstimation
 export sample_priors
 
+
 sample_priors(arg::Union{Planet,System,<:LogDensityModel}, args...; kwargs...) = sample_priors(Random.default_rng(), arg, args...; kwargs...)
 # Sample priors from system once
 function sample_priors(rng::Random.AbstractRNG, system::System)
@@ -141,6 +142,143 @@ Base.@nospecializeinfer function octofit(args...; kwargs...)
     return advancedhmc(args...; kwargs...)
 end
 export octofit
+
+
+"""
+    octofit_rejection(
+        [rng::Random.AbstractRNG],
+        model::Octofitter.LogDensityModel;
+        draws=100_000,
+        verbosity=2,
+    )
+
+Sample from the posterior defined by `model` using rejection sampling with the
+prior as the proposal distribution.
+
+This sampler draws `draws` samples from the prior, evaluates the likelihood at
+each point, and accepts each sample with probability proportional to its
+likelihood. The accepted samples are independent (no autocorrelation), but the
+method can be very inefficient for high-dimensional problems or when the
+posterior is much narrower than the prior.
+
+Returns an `MCMCChains.Chains` object, consistent with `octofit` and
+`octofit_pigeons`.
+"""
+function octofit_rejection end
+octofit_rejection(model::LogDensityModel; kwargs...) = octofit_rejection(Random.default_rng(), model; kwargs...)
+function octofit_rejection(
+    rng::AbstractRNG,
+    model::LogDensityModel;
+    draws::Int=100_000,
+    verbosity::Int=2,
+)
+    start_time = fill(time(), 1)
+
+    # Sample from the prior (proposal distribution)
+    verbosity >= 1 && @info "Drawing $draws samples from prior..."
+    prior_samples = [model.sample_priors(rng) for _ in 1:draws]
+
+    # Build the likelihood function
+    θ_test = model.arr2nt(first(prior_samples))
+    ln_like = make_ln_like(model.system, θ_test)
+
+    # Evaluate log-likelihood for each prior sample.
+    # Use a function barrier so the compiler can specialize on the concrete
+    # types of arr2nt, ln_like, and system (these are abstract when accessed
+    # through model fields in the outer closure).
+    verbosity >= 1 && @info "Evaluating likelihoods..."
+    log_likes = _rejection_evaluate_likelihoods(
+        model.arr2nt, ln_like, model.system, prior_samples
+    )
+
+    # Find the maximum log-likelihood for numerical stability
+    max_ll = maximum(log_likes)
+
+    if !isfinite(max_ll)
+        error("All $(draws) prior samples produced non-finite log-likelihoods. Check your model and priors.")
+    end
+
+    # Accept/reject: accept with probability exp(loglike - max_loglike)
+    accepted_indices = Int[]
+    for i in 1:draws
+        if log_likes[i] == -Inf
+            continue
+        end
+        acceptance_prob = exp(log_likes[i] - max_ll)
+        if rand(rng) < acceptance_prob
+            push!(accepted_indices, i)
+        end
+    end
+
+    n_accepted = length(accepted_indices)
+    if n_accepted == 0
+        error("No samples were accepted out of $(draws) draws. The posterior may be extremely concentrated relative to the prior. Consider increasing `draws` or using a different sampler.")
+    end
+
+    acceptance_rate = n_accepted / draws
+    if verbosity >= 1
+        @info "Rejection sampling complete" draws n_accepted acceptance_rate
+    end
+    if acceptance_rate < 0.001 && verbosity >= 1
+        @warn "Very low acceptance rate ($(round(acceptance_rate*100, sigdigits=2))%). Consider using `octofit` (HMC) for more efficient sampling."
+    end
+
+    # Build the chain results in the same format as octofit.
+    # Again use a function barrier for the hot path.
+    chain_res = _rejection_build_chain(
+        model.arr2nt, model.link, model.ℓπcallback,
+        prior_samples, log_likes, accepted_indices,
+    )
+
+    mcmcchains = Octofitter.result2mcmcchain(
+        chain_res,
+        Dict(:internals => [
+            :loglike,
+            :logpost,
+        ])
+    )
+
+    stop_time = fill(time(), 1)
+
+    mcmcchains_with_info = MCMCChains.setinfo(
+        mcmcchains,
+        (;
+            start_time,
+            stop_time,
+            model_name=model.system.name,
+            sampler="rejection",
+            draws,
+            n_accepted,
+            acceptance_rate,
+        )
+    )
+    return mcmcchains_with_info
+end
+export octofit_rejection
+
+# Function barriers for rejection sampling so the compiler can specialize
+# on the concrete types of the closures stored in LogDensityModel.
+function _rejection_evaluate_likelihoods(arr2nt, ln_like, system, prior_samples)
+    log_likes = Vector{Float64}(undef, length(prior_samples))
+    for (i, θ) in enumerate(prior_samples)
+        resolved = arr2nt(θ)
+        ll = ln_like(system, resolved)
+        log_likes[i] = isfinite(ll) ? ll : -Inf
+    end
+    return log_likes
+end
+
+function _rejection_build_chain(arr2nt, link, ℓπcallback, prior_samples, log_likes, accepted_indices)
+    return map(accepted_indices) do i
+        θ = prior_samples[i]
+        resolved_namedtuple = arr2nt(θ)
+        loglike = log_likes[i]
+        θ_t = link(θ)
+        logpost = ℓπcallback(θ_t)
+        return merge((;loglike, logpost), resolved_namedtuple)
+    end
+end
+
 
 # Define some wrapper functions that hide type information
 # so that we don't have to recompile pathfinder() with each 
@@ -432,7 +570,9 @@ function result2mcmcchain(chain_in, sectionmap=Dict())
                 push!(vals, sample[key])
             elseif sample[key] isa AbstractArray || sample[key] isa Tuple
                 for val in sample[key]
-                    push!(vals, val)
+                    if val isa Number
+                        push!(vals, val)
+                    end
                 end
             end
         end
@@ -444,7 +584,9 @@ function result2mcmcchain(chain_in, sectionmap=Dict())
                     push!(vals, sample.observations[obs][key])
                 elseif sample.observations[obs][key] isa AbstractArray || sample.observations[obs][key] isa Tuple
                     for val in sample.observations[obs][key]
-                        push!(vals, val)
+                        if val isa Number
+                            push!(vals, val)
+                        end
                     end
                 end
             end
@@ -460,7 +602,9 @@ function result2mcmcchain(chain_in, sectionmap=Dict())
                     push!(vals, sample.planets[pl][key])
                 elseif sample.planets[pl][key] isa AbstractArray || sample.planets[pl][key] isa Tuple
                     for val in sample.planets[pl][key]
-                        push!(vals, val)
+                        if val isa Number
+                            push!(vals, val)
+                        end
                     end
                 end
             end
@@ -472,7 +616,9 @@ function result2mcmcchain(chain_in, sectionmap=Dict())
                         push!(vals, sample.planets[pl].observations[obs][key])
                     elseif sample.planets[pl].observations[obs][key] isa AbstractArray || sample.planets[pl].observations[obs][key] isa Tuple
                         for val in sample.planets[pl].observations[obs][key]
-                            push!(vals, val)
+                            if val isa Number
+                                push!(vals, val)
+                            end
                         end
                     end
                 end
@@ -489,6 +635,12 @@ function result2mcmcchain(chain_in, sectionmap=Dict())
     return c
 end
 
+# MCMCChains v7 no longer defines `haskey` for `Chains`, which Octofitter and
+# its extensions rely on to test whether a parameter is present in a chain.
+# Restore the previous behaviour with a single method so that `haskey(chain, key)`
+# keeps working everywhere (including the Makie and PairPlots extensions) without
+# clobbering `Base.haskey` for Dicts/NamedTuples.
+Base.haskey(chain::MCMCChains.Chains, key) = key ∈ names(chain)
 
 """
     mcmcchain2result(model, chain_in,)
@@ -720,10 +872,15 @@ function mcmcchain2result(model, chain, ii=(:))
             if isempty(nt_pl_obs)
                 nt_pl[:observations] = (;)
             else
-                nt_pl[:observations] = namedtuple(Dict(
+                # Build from the actual values (not via a Dict) so the field
+                # types stay concrete: a Dict{Symbol,NamedTuple} with mixed
+                # observation variable sets has an abstract value type, which
+                # namedtuple() would bake into the result's type parameters
+                # and break _system_number_type downstream.
+                nt_pl[:observations] = (; (
                     k => namedtuple(v)
                     for (k,v) in nt_pl_obs
-                ))
+                )...)
             end
             
             return Symbol(pk) => namedtuple(nt_pl)
@@ -762,7 +919,10 @@ function flatten_named_tuple(nt)
         elseif nt[key] isa AbstractArray || nt[key] isa Tuple
             for i in eachindex(nt[key])
                 key_i = Symbol(key, '_', i)
-                push!(pairs, key_i => nt[key][i])
+                val = nt[key][i]
+                if val isa Number
+                    push!(pairs, key_i => val)
+                end
             end
         end
     end
@@ -774,7 +934,10 @@ function flatten_named_tuple(nt)
                 push!(pairs, Symbol(obs, '_', key) => nt.observations[obs][key])
             elseif nt.observations[obs][key] isa AbstractArray || nt.observations[obs][key] isa Tuple
                 for i in eachindex(nt.observations[obs][key])
-                    push!(pairs, Symbol(obs, '_', key, '_', i) => nt.observations[obs][key][i])
+                    val = nt.observations[obs][key][i]
+                    if val isa Number
+                        push!(pairs, Symbol(obs, '_', key, '_', i) => val)
+                    end
                 end
             end
         end
@@ -790,7 +953,10 @@ function flatten_named_tuple(nt)
                 push!(pairs, Symbol(pl, '_', key) => nt.planets[pl][key])
             elseif nt.planets[pl][key] isa AbstractArray || nt.planets[pl][key] isa Tuple
                 for i in eachindex(nt.planets[pl][key])
-                    push!(pairs, Symbol(pl, '_', key, '_', i) => nt.planets[pl][key][i])
+                    val = nt.planets[pl][key][i]
+                    if val isa Number
+                        push!(pairs, Symbol(pl, '_', key, '_', i) => val)
+                    end
                 end
             end
         end
@@ -802,7 +968,10 @@ function flatten_named_tuple(nt)
                     push!(pairs, Symbol(pl, '_', obs, '_', key) => nt.planets[pl].observations[obs][key])
                 elseif nt.planets[pl].observations[obs][key] isa AbstractArray || nt.planets[pl].observations[obs][key] isa Tuple
                     for i in eachindex(nt.planets[pl].observations[obs][key])
-                        push!(pairs, Symbol(pl, '_', obs, '_', key, '_', i) => nt.planets[pl].observations[obs][key][i])
+                        val = nt.planets[pl].observations[obs][key][i]
+                        if val isa Number
+                            push!(pairs, Symbol(pl, '_', obs, '_', key, '_', i) => val)
+                        end
                     end
                 end
             end
@@ -811,5 +980,3 @@ function flatten_named_tuple(nt)
     
     return namedtuple(pairs)
 end
-
-include("octoquick.jl")

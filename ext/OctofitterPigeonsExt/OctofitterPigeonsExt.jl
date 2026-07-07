@@ -14,7 +14,12 @@ function Pigeons.initialization(model::Octofitter.LogDensityModel, rng::Abstract
 
     Octofitter.get_starting_point!!(rng, model)
 
-    if isnothing(model.starting_points) || !haskey(model.starting_points, chain_no)
+    # `model.starting_points` is a `Vector` (see LogDensityModel), so validate the
+    # chain index with a bounds check. (Previously this used `haskey`, which is not
+    # defined for `Vector`/`Int` and only worked incidentally when some other loaded
+    # package provided it; under MPI the child process loads a minimal set of
+    # packages and `haskey(::Vector, ::Int)` is undefined.)
+    if isnothing(model.starting_points) || !checkbounds(Bool, model.starting_points, chain_no)
         @show model.starting_points chain_no
         error("Insufficient starting points provided. Provide at least one per chain. (model.starting_points is too short)")
     end
@@ -88,6 +93,16 @@ Base.@nospecializeinfer function Octofitter.octofit_pigeons(
     # an orbit solve takes about 32ns, or 1/14 as long.
     else
         Octofitter._kepsolve_use_threads[] = Octofitter._count_epochs(target.system) > 15*Threads.nthreads()
+    end
+
+    # Variational rereference often causes errors when used on models with 
+    # discrete variables.
+    # We disable that for now. 
+    contains_discrete_variables = any(isa.(sample_priors(Random.default_rng(), target.system),Integer))
+    if contains_discrete_variables && ( !isnothing(variational) || n_chains_variational != 0)
+        @info "Variational reference is not supported with discrete variables; disabling and setting n_chains_variational=0."
+        variational = nothing
+        n_chains_variational = 0
     end
 
 

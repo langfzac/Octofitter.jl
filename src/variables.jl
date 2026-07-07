@@ -1,34 +1,137 @@
-abstract type AbstractLikelihood end
-TypedTables.Table(like::AbstractLikelihood) = like.table
+"""
+    AbstractObservationContext
+
+Abstract type representing the evaluation context for computing likelihood.
+Contains all parameters and precomputed values needed for likelihood evaluation,
+except for the observation/likelihood object itself.
+"""
+abstract type AbstractObservationContext end
 
 """
-    ln_like(likeobj::AbstractLikelihood,  θ_planet, orbit, orbit_solutions, i_orbsol_start)
+    SystemObservationContext{TSystem,TObs,N,TOrbit,TSolutions}
 
-Compute the natural log of the likelihood of the data given by `likeobj` being generated
-given the model parameters `θ_planet`. 
+Evaluation context for system-level observations (e.g., RV, proper motion anomaly).
 
-The remaining parameters are pre-calculated cached values generated `θ_planet`.
+# Fields
+- `θ_system::NamedTuple` - System-level parameters (M, parallax, pmra, pmdec, etc.)
+- `θ_obs::NamedTuple` - Observation-specific parameters (offset, jitter, etc.)
+- `orbits::NTuple{N,TOrbit}` - Tuple of all planet orbits
+- `orbit_solutions::NTuple{N,TSolutions}` - Pre-solved orbit solutions for all planets
+- `orbit_solutions_i_epoch_start::Int` - Starting index into solutions array (0-based)
+"""
+struct SystemObservationContext{TSystem<:NamedTuple,TObs<:NamedTuple,N,TOrbit<:AbstractOrbit,TSolutions} <: AbstractObservationContext
+    θ_system::TSystem
+    θ_obs::TObs
+    orbits::NTuple{N,TOrbit}
+    orbit_solutions::NTuple{N,TSolutions}
+    orbit_solutions_i_epoch_start::Int
+
+    function SystemObservationContext(θ_system::TSystem, θ_obs::TObs, orbits::NTuple{N,TOrbit}, orbit_solutions::NTuple{N,TSolutions}, orbit_solutions_i_epoch_start::Int) where {TSystem<:NamedTuple,TObs<:NamedTuple,N,TOrbit<:AbstractOrbit,TSolutions}
+        new{TSystem,TObs,N,TOrbit,TSolutions}(θ_system, θ_obs, orbits, orbit_solutions, orbit_solutions_i_epoch_start)
+    end
+    # When there are no planets, orbits/solutions are empty tuples and TOrbit can't be inferred.
+    function SystemObservationContext(θ_system::TSystem, θ_obs::TObs, orbits::Tuple{}, orbit_solutions::Tuple{}, orbit_solutions_i_epoch_start::Int) where {TSystem<:NamedTuple,TObs<:NamedTuple}
+        new{TSystem,TObs,0,AbstractOrbit{Float64},Tuple{}}(θ_system, θ_obs, orbits, orbit_solutions, orbit_solutions_i_epoch_start)
+    end
+end
+
+
+"""
+    PlanetObservationContext{TSystem,TPlanet,TObs,N,TOrbit,TSolutions}
+
+Evaluation context for planet-level observations (e.g., relative astrometry).
+
+# Fields
+- `θ_system::NamedTuple` - System-level parameters
+- `θ_planet::NamedTuple` - This planet's parameters (a, e, i, Ω, ω, τ, mass, etc.)
+- `θ_obs::NamedTuple` - Observation-specific parameters
+- `orbits::NTuple{N,TOrbit}` - Tuple of all planet orbits
+- `orbit_solutions::NTuple{N,TSolutions}` - Pre-solved orbit solutions for all planets
+- `i_planet::Int` - Index of this planet in the orbits/solutions arrays
+- `orbit_solutions_i_epoch_start::Int` - Starting index into solutions array (0-based)
+"""
+struct PlanetObservationContext{TSystem<:NamedTuple,TPlanet<:NamedTuple,TObs<:NamedTuple,N,TOrbit<:AbstractOrbit,TSolutions} <: AbstractObservationContext
+    θ_system::TSystem
+    θ_planet::TPlanet
+    θ_obs::TObs
+    orbits::NTuple{N,TOrbit}
+    orbit_solutions::NTuple{N,TSolutions}
+    i_planet::Int
+    orbit_solutions_i_epoch_start::Int
+end
+
+# Outer constructor with type inference
+function PlanetObservationContext(
+    θ_system,
+    θ_planet,
+    θ_obs,
+    orbits,
+    orbit_solutions,
+    i_planet::Int,
+    orbit_solutions_i_epoch_start::Int
+)
+    return PlanetObservationContext{typeof(θ_system),typeof(θ_planet),typeof(θ_obs),length(orbits),eltype(orbits),eltype(orbit_solutions)}(
+        θ_system, θ_planet, θ_obs, orbits, orbit_solutions, i_planet, orbit_solutions_i_epoch_start
+    )
+end
+
+
+"""
+    AbstractObs
+
+Abstract type for observation objects. These objects bundle observational data along with
+any associated nuisance parameters that are added to the model.
+
+Previously named `AbstractLikelihood`.
+"""
+abstract type AbstractObs end
+TypedTables.Table(like::AbstractObs) = like.table
+
+# Backwards compatibility alias
+const AbstractLikelihood = AbstractObs
+
+"""
+    ln_like(obs::AbstractObs, ctx::AbstractObservationContext)
+
+Compute the natural log of the likelihood of the data given by `obs` being generated
+given the model parameters in the observation context `ctx`.
+
+The context contains system parameters, observation parameters, orbits, and pre-calculated
+orbit solutions generated from the system parameters.
 """
 function ln_like end
 
 """
-    likeobj_from_epoch_subset(likeobj::AbstractLikelihood,  observation_indices)
+    likeobj_from_epoch_subset(obs::AbstractObs, observation_indices)
 
-Given a likelihood object that wraps an observation table, construct a new one only containing
+Given an observation object that wraps an observation table, construct a new one only containing
 observations specified by the index or indices in `observation_indices`.
 
 This allows sub-setting data for various statistical checks.
 """
 function likeobj_from_epoch_subset end
 
-"""
-    likelihoodname(likeobj::AbstractLikelihood)
+# Generic fallback method for observation types that don't support subsetting
+function likeobj_from_epoch_subset(obs::AbstractObs, obs_inds)
+    error("""
+    Data subsetting is not supported for observation type $(typeof(obs)).
 
-Return the name for a likelihood object. 
-Most likelihood objects have a `name` field, but some specialized
+    This observation type has not implemented the `likeobj_from_epoch_subset` method,
+    which is required for cross-validation, PSIS-LOO, and other data subsetting operations.
+
+    If you need cross-validation support, consider using an alternative observation type
+    that supports subsetting, or file an issue requesting this feature.
+    """)
+end
+
+"""
+    likelihoodname(obs::AbstractObs)
+
+Return the name for an observation object.
+Most observation objects have a `name` field, but some specialized
 types may override this function to provide their name differently.
 """
-likelihoodname(likeobj::AbstractLikelihood) = likeobj.name
+likelihoodname(obs::AbstractObs) = obs.name
 export likelihoodname
 
 
@@ -161,7 +264,7 @@ UniformCircular() = UniformCircular(2π)
 export UniformCircular
 
 # We need to create a "prior" on the length of the unit vector so that it doesn't get pinched at (0,0)
-struct UnitLengthPrior{X,Y} <: AbstractLikelihood
+struct UnitLengthPrior{X,Y} <: AbstractObs
     varx::Symbol
     vary::Symbol
 end
@@ -202,14 +305,17 @@ function likeobj_from_epoch_subset(obs::UnitLengthPrior{X,Y}, obs_inds) where {X
 end
 TypedTables.Table(like::UnitLengthPrior) = nothing
 
-function ln_like(::UnitLengthPrior{X,Y}, θ_system::NamedTuple, _args...) where {X,Y}
-    x = getproperty(θ_system, X)
-    y = getproperty(θ_system, Y)
+# System-level UnitLengthPrior
+function ln_like(::UnitLengthPrior{X,Y}, ctx::SystemObservationContext) where {X,Y}
+    x = getproperty(ctx.θ_system, X)
+    y = getproperty(ctx.θ_system, Y)
     vector_length = sqrt(x^2 + y^2)
     return logpdf(LogNormal(log(1.0), 0.1), vector_length);
 end
-function ln_like(::UnitLengthPrior{X,Y}, θ_system::NamedTuple, θ_planet::NamedTuple, _args...) where {X,Y}
-    θ = merge(θ_system, θ_planet)
+
+# Planet-level UnitLengthPrior
+function ln_like(::UnitLengthPrior{X,Y}, ctx::PlanetObservationContext) where {X,Y}
+    θ = merge(ctx.θ_system, ctx.θ_planet)
     x = getproperty(θ, X)
     y = getproperty(θ, Y)
     vector_length = sqrt(x^2 + y^2)
@@ -223,7 +329,7 @@ generate_from_params(like::UnitLengthPrior, args...; kwargs...) = like
 
 
 # User-defined likelihood for expressions that should follow a distribution
-struct UserLikelihood{TSym_LHS, TSym_RHS} <: AbstractLikelihood
+struct UserLikelihood{TSym_LHS, TSym_RHS} <: AbstractObs
     priors::Priors
     derived::Derived
     name::String
@@ -237,12 +343,13 @@ likelihoodname(like::UserLikelihood) = like.name
 _isprior(::UserLikelihood) = true
 likeobj_from_epoch_subset(like::UserLikelihood, obs_inds) = like
 TypedTables.Table(::UserLikelihood) = nothing
-generate_from_params(like::UserLikelihood, θ_planet, orbit) = like
+generate_from_params(like::UserLikelihood, ctx::SystemObservationContext; add_noise) = like
+generate_from_params(like::UserLikelihood, ctx::PlanetObservationContext; add_noise) = like
 
 # System-level likelihood
-function ln_like(user_like::UserLikelihood{TSym_LHS, TSym_RHS}, θ_system::NamedTuple, _args...) where {TSym_LHS, TSym_RHS}
-    lhs = getproperty(θ_system, TSym_LHS)
-    rhs = getproperty(θ_system, TSym_RHS)
+function ln_like(user_like::UserLikelihood{TSym_LHS, TSym_RHS}, ctx::SystemObservationContext) where {TSym_LHS, TSym_RHS}
+    lhs = getproperty(ctx.θ_system, TSym_LHS)
+    rhs = getproperty(ctx.θ_system, TSym_RHS)
     if rhs isa NTuple{N,<:Number} where N
         rhs = SVector(rhs)
     end
@@ -256,14 +363,20 @@ function ln_like(user_like::UserLikelihood{TSym_LHS, TSym_RHS}, θ_system::Named
 end
 
 # Planet-level likelihood
-function ln_like(user_like::UserLikelihood{TSym_LHS, TSym_RHS}, θ_system::NamedTuple, θ_planet::NamedTuple, θ_obs::NamedTuple, _args...) where {TSym_LHS, TSym_RHS}
-    θ = merge(θ_planet, θ_obs)
+function ln_like(user_like::UserLikelihood{TSym_LHS, TSym_RHS}, ctx::PlanetObservationContext) where {TSym_LHS, TSym_RHS}
+    θ = merge(ctx.θ_planet, ctx.θ_obs)
     lhs = getproperty(θ, TSym_LHS)
     rhs = getproperty(θ, TSym_RHS)
     if rhs isa NTuple{N,<:Number} where N
         rhs = SVector(rhs)
     end
-    return logpdf(lhs, rhs)
+    if lhs isa Distribution
+        return logpdf(lhs, rhs)
+    elseif rhs isa Distribution
+        return logpdf(rhs, lhs)
+    else
+        error("neither the left nor right hand side of the `~` expression evaluated to a distribution")
+    end
 end
 
 # Show method
@@ -271,11 +384,50 @@ function Base.show(io::IO, mime::MIME"text/plain", like::UserLikelihood{TSym_LHS
     println(io, "UserLikelihood: $TSym_LHS ~ $TSym_RHS")
 end
 
+"""
+    DirectLLObs{TSym} <: AbstractObs
+
+A likelihood contribution specified directly as a log-likelihood value via `LL += expr`
+in a `@variables` block. The expression is evaluated as a derived variable and its
+numeric value is added directly to the log-likelihood.
+
+This is an escape hatch for cases where the likelihood cannot be expressed as
+`logpdf(Distribution, value)`, e.g. marginalized likelihoods from analytic integrals.
+"""
+struct DirectLLObs{TSym} <: AbstractObs
+    priors::Priors
+    derived::Derived
+    name::String
+end
+DirectLLObs(sym::Symbol, name::String) = DirectLLObs{sym}(Priors(), Derived(), name)
+
+likelihoodname(like::DirectLLObs) = like.name
+_isprior(::DirectLLObs) = true
+likeobj_from_epoch_subset(like::DirectLLObs, obs_inds) = like
+TypedTables.Table(::DirectLLObs) = nothing
+generate_from_params(like::DirectLLObs, ctx::SystemObservationContext; add_noise) = like
+generate_from_params(like::DirectLLObs, ctx::PlanetObservationContext; add_noise) = like
+
+function ln_like(like::DirectLLObs{TSym}, ctx::SystemObservationContext) where {TSym}
+    val = getproperty(ctx.θ_system, TSym)
+    return val
+end
+
+function ln_like(like::DirectLLObs{TSym}, ctx::PlanetObservationContext) where {TSym}
+    θ = merge(ctx.θ_planet, ctx.θ_obs)
+    val = getproperty(θ, TSym)
+    return val
+end
+
+function Base.show(io::IO, mime::MIME"text/plain", like::DirectLLObs{TSym}) where {TSym}
+    println(io, "DirectLLObs: LL += $TSym")
+end
+
 # We need a blank likelihood type to hold variables when constructing
 # e.g. prior only models.
-# TODO: In future if/when we get RHS ~ working in our models, we can probably 
+# TODO: In future if/when we get RHS ~ working in our models, we can probably
 # use those objects for this purpose too.
-struct BlankLikelihood <: AbstractLikelihood
+struct BlankLikelihood <: AbstractObs
     priors::Priors
     derived::Derived
     name::String
@@ -287,8 +439,14 @@ struct BlankLikelihood <: AbstractLikelihood
         return new(priors,derived,name)
     end
 end
-function Octofitter.ln_like(::BlankLikelihood, θ_system, args...)
-    T = Octofitter._system_number_type(θ_system)
+
+# BlankLikelihood works with both system and planet contexts
+function Octofitter.ln_like(::BlankLikelihood, ctx::SystemObservationContext)
+    T = Octofitter._system_number_type(ctx.θ_system)
+    return zero(T)
+end
+function Octofitter.ln_like(::BlankLikelihood, ctx::PlanetObservationContext)
+    T = Octofitter._system_number_type(ctx.θ_system)
     return zero(T)
 end
 
@@ -311,7 +469,7 @@ function Planet(;
     name::Union{Symbol,AbstractString},
     basis::Type,
     variables::Tuple,
-    likelihoods=()
+    observations=()
 )
     (priors,derived,additional_likelihoods...)=variables
     name = Symbol(name)
@@ -321,7 +479,7 @@ function Planet(;
     for l in additional_likelihoods
         l::AbstractLikelihood
     end
-    likes = (likelihoods..., additional_likelihoods...)
+    likes = (observations..., additional_likelihoods...)
     
     # Check for duplicate observation/likelihood names on this planet
     like_names = String[]
@@ -387,7 +545,7 @@ function System(;
     name::Union{Symbol,AbstractString},
     variables::Tuple,
     companions=(),
-    likelihoods=()
+    observations=()
 )
     (priors,derived,additional_likelihoods...)=variables
     name = Symbol(name)
@@ -400,7 +558,7 @@ function System(;
     for p in companions
         p::Planet
     end
-    likes = (likelihoods..., additional_likelihoods...)
+    likes = (observations..., additional_likelihoods...)
     
     # Check for duplicate observation/likelihood names at system level
     like_names = String[]
@@ -1359,7 +1517,14 @@ _system_number_type(T::NamedTuple) = _system_number_type(typeof(T))
         if V <: Number
             T = promote_type(T, V)
         elseif V <: NamedTuple
-            T = promote_type(T, _system_number_type(V))
+            # Only recurse into concretely-typed nested tuples. An abstractly
+            # typed field (e.g. a bare `NamedTuple`) can appear in values
+            # reconstructed outside the sampler hot path; its contents can't
+            # be inspected at compile time, so let the sibling numeric fields
+            # determine the number type instead of erroring.
+            if isconcretetype(V)
+                T = promote_type(T, _system_number_type(V))
+            end
         elseif V <: Tuple
             T = promote_type(T, eltype(V))
         end

@@ -31,47 +31,49 @@ macro variables(variables_block_input)
             # Check if LHS is a distribution (Distribution(...) ~ expression)
             u = union(seen_prior_vars, seen_derived_vars)
             if varname in u || expression in u || (statement.args[2] isa Expr && statement.args[2].head == :call)
-                # This is a user likelihood: Distribution(...) ~ expression
+                # This is a user likelihood: lhs_expr ~ Distribution
                 lhs_expr = varname
                 rhs_expr = expression
-                
-                # Generate unique symbol for the derived variable
-                derived_sym_lhs = Symbol("lhs_",generate_userlike_name(rhs_expr))
-                derived_sym_rhs = Symbol("rhs_",generate_userlike_name(rhs_expr))
-                
-                # Check for duplicate derived variable names (including generated ones)
+
+                # Name the likelihood after the LHS (the quantity being constrained) —
+                # this is typically a meaningful name the user already wrote, and
+                # avoids collisions when the same distribution is reused.
+                name_seed = generate_userlike_name(lhs_expr)
+
+                local_quote_vars = Symbol[]
+                local_quote_vals = Any[]
+                processed_expr_rhs = quasiquote!(deepcopy(rhs_expr), local_quote_vars, local_quote_vals)
+
+                # If the LHS is a bare Symbol already defined as a derived variable,
+                # reuse it directly instead of creating a redundant lhs_* copy.
+                # Otherwise (compound LHS like `a + b ~ ...`), synthesize lhs_<name_seed>.
+                if lhs_expr isa Symbol && lhs_expr in seen_derived_vars
+                    derived_sym_lhs = lhs_expr
+                else
+                    derived_sym_lhs = Symbol("lhs_", name_seed)
+                    if derived_sym_lhs in seen_derived_vars
+                        error("Generated derived variable name '$derived_sym_lhs' conflicts with existing variable. Please use a different expression or variable name.")
+                    end
+                    processed_expr_lhs = quasiquote!(deepcopy(lhs_expr), local_quote_vars, local_quote_vals)
+                    derived_vars[derived_sym_lhs] = processed_expr_lhs
+                    push!(seen_derived_vars, derived_sym_lhs)
+                end
+
+                derived_sym_rhs = Symbol("rhs_", name_seed)
                 if derived_sym_rhs in seen_derived_vars
                     error("Generated derived variable name '$derived_sym_rhs' conflicts with existing variable. Please use a different expression or variable name.")
                 end
-                if derived_sym_lhs in seen_derived_vars
-                    error("Generated derived variable name '$derived_sym_lhs' conflicts with existing variable. Please use a different expression or variable name.")
-                end
-                push!(seen_derived_vars, derived_sym_lhs)
                 push!(seen_derived_vars, derived_sym_rhs)
-                
-                # Process the RHS expression for variable capture
-                local_quote_vars = Symbol[]
-                local_quote_vals = Any[]
-                processed_expr_lhs = quasiquote!(deepcopy(lhs_expr), local_quote_vars, local_quote_vals)
-                processed_expr_rhs = quasiquote!(deepcopy(rhs_expr), local_quote_vars, local_quote_vals)
-                
-                # Add to global captured variables
+                derived_vars[derived_sym_rhs] = processed_expr_rhs
+
                 for (var, val) in zip(local_quote_vars, local_quote_vals)
                     if !(var in all_quote_vars)
                         push!(all_quote_vars, var)
                         push!(all_quote_vals, val)
                     end
                 end
-                
-                # Add to derived variables
-                derived_vars[derived_sym_rhs] = processed_expr_rhs
-                derived_vars[derived_sym_lhs] = processed_expr_lhs
-                
-                # Create UserLikelihood
-                # Generate name from distribution type and expression
-                like_name = generate_userlike_name(rhs_expr)
-                
-                push!(user_likelihoods, UserLikelihood(derived_sym_lhs, derived_sym_rhs, like_name))
+
+                push!(user_likelihoods, UserLikelihood(derived_sym_lhs, derived_sym_rhs, name_seed))
                 # push!(user_likelihoods, quote
                 #     distribution = try
                 #         $(esc(dist_expr))
@@ -144,6 +146,33 @@ macro variables(variables_block_input)
             
             # Store the processed expression directly (not wrapped in a function)
             derived_vars[varname] = processed_expr
+        elseif statement.head == :(+=) && statement.args[1] == :LL
+            # LL += expr: add an arbitrary log-likelihood contribution
+            expression = statement.args[2]
+
+            # Generate a unique derived variable name for this LL term
+            ll_count = count(k -> startswith(string(k), "_LL_"), seen_derived_vars) + 1
+            derived_sym = Symbol("_LL_", ll_count)
+            push!(seen_derived_vars, derived_sym)
+
+            # Process the expression to extract interpolated variables
+            local_quote_vars = Symbol[]
+            local_quote_vals = Any[]
+            processed_expr = quasiquote!(deepcopy(expression), local_quote_vars, local_quote_vals)
+
+            # Add to global captured variables (avoiding duplicates)
+            for (var, val) in zip(local_quote_vars, local_quote_vals)
+                if !(var in all_quote_vars)
+                    push!(all_quote_vars, var)
+                    push!(all_quote_vals, val)
+                end
+            end
+
+            # Store as a derived variable
+            derived_vars[derived_sym] = processed_expr
+
+            # Create DirectLLObs to inject this value into the log-likelihood
+            push!(user_likelihoods, DirectLLObs(derived_sym, "LL_$ll_count"))
         else
             error("invalid statement encountered $(statement.head)")
         end
@@ -241,10 +270,10 @@ function quasiquote!(ex::Expr, vars::Vector{Symbol}, vals::Vector)
 end
 
 # Helper function to create human-readable names for user likelihoods
-function generate_userlike_name(rhs_expr)
-   
+function generate_userlike_name(expr)
+
     # Simplify expression string
-    expr_str = string(rhs_expr)
+    expr_str = string(expr)
     
     # Replace common mathematical operators with words
     expr_str = replace(expr_str, "^" => "_pow_")
@@ -289,7 +318,19 @@ end
 vars = vcat(vars1, vars2)
 ```
 """
-function Base.vcat(vars1::Tuple, vars2::Tuple, vars_rest::Tuple...)
+function Base.vcat(
+    vars1::Tuple{Priors,Derived,Vararg},
+    vars2::Tuple{Priors,Derived,Vararg},
+    vars_rest::Tuple{Priors,Derived,Vararg}...,
+)
+    # NOTE: dispatch is restricted to tuples whose first two elements are a
+    # `Priors` and a `Derived` (i.e. the output of the `@variables` macro). This
+    # avoids type-piracy on `Base.vcat(::Tuple, ...)`, which otherwise hijacks
+    # ordinary tuple `vcat`/matrix-literal calls in *other* packages (e.g. SIMD.jl's
+    # `const CAST_SIZE_CHANGE_FLOAT = [(:fptrunc, >); (:fpext, <)]`) and throws
+    # "First argument does not appear to be from @variables macro". That surfaces
+    # when those packages are loaded from source (e.g. Pigeons MPI child processes
+    # run with `--compiled-modules=no` on Julia < 1.11).
     # Check that these are actually @variables outputs
     # They should have at least Priors and Derived as first two elements
     if length(vars1) < 2 || !isa(vars1[1], Priors) || !isa(vars1[2], Derived)
@@ -400,5 +441,6 @@ function _vcat_two_variables(vars1::Tuple, vars2::Tuple)
     end
 end
 
-# Also support concatenating more than 2 blocks at once using varargs
-Base.vcat(vars::Tuple...) = Base.vcat(vars[1], vars[2], vars[3:end]...)
+# Also support concatenating more than 2 blocks at once using varargs.
+# Restricted to @variables-shaped tuples to avoid type-piracy (see note above).
+Base.vcat(vars::Tuple{Priors,Derived,Vararg}...) = Base.vcat(vars[1], vars[2], vars[3:end]...)

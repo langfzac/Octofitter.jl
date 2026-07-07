@@ -34,12 +34,12 @@ LogLikelihoodMap(
 Epoch is in MJD.
 Platescale is in mas/px.
 """
-struct LogLikelihoodMap{TTable<:Table} <: Octofitter.AbstractLikelihood
+struct LogLikelihoodMapObs{TTable<:Table} <: Octofitter.AbstractObs
     table::TTable
     priors::Octofitter.Priors
     derived::Octofitter.Derived
     name::String
-    function LogLikelihoodMap(
+    function LogLikelihoodMapObs(
         table;
         name::String="likemap",
         variables::Tuple{Octofitter.Priors,Octofitter.Derived}=(Octofitter.@variables begin end)
@@ -70,17 +70,22 @@ struct LogLikelihoodMap{TTable<:Table} <: Octofitter.AbstractLikelihood
     end
 end
 # Legacy constructor for backward compatibility
-LogLikelihoodMap(observations::NamedTuple...; kwargs...) = LogLikelihoodMap(Table(observations...); kwargs...)
-export LogLikelihoodMap
+LogLikelihoodMapObs(observations::NamedTuple...; kwargs...) = LogLikelihoodMapObs(Table(observations...); kwargs...)
 
-function Octofitter.likeobj_from_epoch_subset(obs::LogLikelihoodMap, obs_inds)
-    return LogLikelihoodMap(obs.table[obs_inds,:,1]...)
+# Backwards compatibility alias
+const LogLikelihoodMap = LogLikelihoodMapObs
+
+export LogLikelihoodMap, LogLikelihoodMapObs
+
+function Octofitter.likeobj_from_epoch_subset(obs::LogLikelihoodMapObs, obs_inds)
+    return LogLikelihoodMapObs(obs.table[obs_inds,:,1]...)
 end
 
 """
 Likelihood of there being planets in a sequence of likemaps.
 """
-function Octofitter.ln_like(likemaps::LogLikelihoodMap, θ_system, θ_planet, θ_obs, orbits, orbit_solutions, i_planet, orbit_solutions_i_epoch_start)
+function Octofitter.ln_like(likemaps::LogLikelihoodMapObs, ctx::Octofitter.PlanetObservationContext)
+    (; θ_system, θ_planet, θ_obs, orbits, orbit_solutions, i_planet, orbit_solutions_i_epoch_start) = ctx
 
     # Resolve the combination of system and planet parameters
     # as a Visual{KepOrbit} object. This pre-computes
@@ -90,7 +95,7 @@ function Octofitter.ln_like(likemaps::LogLikelihoodMap, θ_system, θ_planet, θ
 
 
     likemaps_table = likemaps.table
-    T = Octofitter._system_number_type(θ_planet)
+    T = Octofitter._system_number_type(θ_system)
     ll = zero(T)
     
     # Get calibration parameters from observation variables
@@ -100,7 +105,9 @@ function Octofitter.ln_like(likemaps::LogLikelihoodMap, θ_system, θ_planet, θ
     for i_epoch in eachindex(likemaps_table.epoch)
 
         sol = orbit_solutions[i_planet][i_epoch+orbit_solutions_i_epoch_start]
-        @assert isapprox(likemaps.table.epoch[i_epoch], PlanetOrbits.soltime(sol), rtol=1e-2)
+        # Bookkeeping check that this pre-solved solution belongs to this data
+        # epoch (exact identity; see rv-relative.jl for details).
+        @assert PlanetOrbits.soltime(sol) == likemaps.table.epoch[i_epoch] "pre-solved orbit solution does not match this epoch (indexing bug)"
         ra_host_perturbation = zero(T)
         dec_host_perturbation = zero(T)
         for (i_other_planet, key) in enumerate(keys(θ_system.planets))
@@ -119,8 +126,8 @@ function Octofitter.ln_like(likemaps::LogLikelihoodMap, θ_system, θ_planet, θ
                 ra_host_perturbation += raoff(sol′, mass_other)
                 dec_host_perturbation += decoff(sol′, mass_other)
 
-                @assert isapprox(likemaps.table.epoch[i_epoch], PlanetOrbits.soltime(sol), rtol=1e-2)
-                @assert isapprox(likemaps.table.epoch[i_epoch], PlanetOrbits.soltime(sol′), rtol=1e-2)
+                @assert PlanetOrbits.soltime(sol) == likemaps.table.epoch[i_epoch] "pre-solved orbit solution does not match this epoch (indexing bug)"
+                @assert PlanetOrbits.soltime(sol′) == likemaps.table.epoch[i_epoch] "pre-solved orbit solution does not match this epoch (indexing bug)"
             end
         end
 

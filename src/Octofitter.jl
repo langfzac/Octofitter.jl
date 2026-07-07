@@ -26,10 +26,11 @@ export CSV
 using Reexport
 @reexport using PlanetOrbits
 
+export Table, FlexTable
+
 export KernelDensity
 
-# Re-export from TypedTables
-export Table, FlexTable
+# TypedTables used internally; extensions should import directly
 
 using Base.Threads: @threads
 using StaticArrays 
@@ -43,7 +44,7 @@ const mjup2msol = PlanetOrbits.mjup2msol_IAU
 
 # Re-export the Chains constructor.
 export Chains 
-
+export describe
 include("units.jl")
 include("orbit-models.jl")
 include("distributions.jl")
@@ -58,14 +59,10 @@ include("likelihoods/system.jl")
 include("likelihoods/relative-astrometry.jl")
 include("likelihoods/photometry.jl")
 include("likelihoods/hgca.jl")
-# TODO: consolidate some of these
-include("likelihoods/gaia-linefit.jl")
-include("likelihoods/gaia-cor.jl")
-include("likelihoods/gaia-ueva.jl")
-include("likelihoods/gaia.jl") # remove this
+include("likelihoods/gaia-utils.jl")
 include("likelihoods/hipparcos.jl")
 include("likelihoods/hgca-linfit.jl")
-include("likelihoods/abs-astrom.jl")
+include("likelihoods/g23h.jl")
 include("likelihoods/gaia-dr4.jl")
 
 include("likelihoods/prior-observable.jl")
@@ -75,19 +72,19 @@ include("likelihoods/prior-non-crossing.jl")
 
 include("logdensitymodel.jl")
 include("initialization.jl")
-include("optimization.jl")
 include("sampling.jl")
 
 include("analysis.jl")
 include("sonora.jl")
 include("BHAC.jl")
 
+include("nss.jl")
 include("io.jl")
 include("io-orbitize.jl")
 
 include("sbc.jl")
-include("predictive-distributions.jl")
 include("cross-validation.jl")
+include("completeness.jl")
 
 """
     using Pigeons
@@ -151,7 +148,10 @@ Place `using AppleAccelerate` at the start of your script to suppress this messa
     end
 
     # Some octofitter likelihoods can cause errors when nansafe_mode isn't set to true.
-    set_preferences!(ForwardDiff, "nansafe_mode" => true)
+    nansafe_mode = load_preference(ForwardDiff, "nansafe_mode")
+    if isnothing(nansafe_mode) || !nansafe_mode
+        set_preferences!(ForwardDiff, "nansafe_mode" => true)
+    end
 
     # JPL Horizons seems to allow their SSL certifcates to expire all the time.
     # We have to disable certificate checking in order to be able to query it
@@ -270,19 +270,48 @@ Place `using AppleAccelerate` at the start of your script to suppress this messa
         "c340a944068f6ffdb3b2ce755cf736895917b0251a175c4578a36abb9ffdc72e"
     ))
 
-    register(DataDep("BHAC15_GAIA", 
+    register(DataDep("BHAC15_GAIA",
         """
         Dataset: BHA15 Isochrone models
         Author: Isabelle Baraffe, Derek Homeier, France Allard, and Gilles Chabrier
         Publication: "New evolutionary models for pre-main sequence and main sequence low-mass stars down to the hydrogen-burning limit"
-        
+
         """,
         "https://perso.ens-lyon.fr/isabelle.baraffe/BHAC15dir/BHAC15_iso.GAIA",
         "43ba70b5ae87d32fdc2cd8b1346ad705b24c97d17b223510aa8a7bc8d753ab76"
     ))
 
+    register(DataDep("G23H_Catalog",
+        """
+        Dataset: G23H - Calibrated Gaia DR2, DR3, and Hipparcos Catalog
+        Author: Thompson et al.
+        License: Creative Commons
+        Website: http://dx.doi.org/10.11570/26.0002
+
+        A composite catalog combining calibrated proper motions from Hipparcos, Gaia DR2, and Gaia DR3,
+        along with astrometric excess noise calibration and RV variability data from the 'paired' catalog.
+
+        This catalog enables joint modeling of:
+        - Hipparcos proper motions and intermediate astrometric data (IAD)
+        - Hipparcos-Gaia proper motion anomaly (from HGCA)
+        - Calibrated Gaia DR2 proper motions
+        - DR3-DR2 scaled position differences
+        - Gaia DR3 proper motions
+        - Gaia astrometric excess noise (RUWE/UEVA)
+        - Gaia RV variability constraints
+
+        For use with GaiaHipparcosUEVAJointObs likelihood objects.
+
+        WARNING: This is a large file (~14 GB). Download may take considerable time.
+        For local testing, you can pass a local file path directly to the catalog parameter.
+
+        File format: Apache Arrow (feather)
+        File size: ~14 GB
+        """,
+        "https://www.canfar.net/storage/vault/file/AstroDataCitationDOI/CISTI.CANFAR/26.0002/data/G23H-v1.0.feather",
+        # No hash verification for this large file - users should verify integrity manually
+    ))
+
     return
 end
-
-# include("precompile.jl")
 end
