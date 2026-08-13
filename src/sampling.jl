@@ -2,7 +2,6 @@ using DiffResults
 using LinearAlgebra
 using Preferences
 using Pathfinder
-using Transducers
 using CovarianceEstimation
 export sample_priors
 
@@ -674,7 +673,7 @@ function mcmcchain2result(model, chain, ii=(:))
         end
         if nt[key] isa Number
             push!(key_mapping, key => [key])
-        elseif  nt[key] isa Tuple
+        elseif  nt[key] isa AbstractArray || nt[key] isa Tuple
             arr = Symbol[]
             push!(key_mapping, key => arr)
             for i in eachindex(nt[key])
@@ -690,7 +689,7 @@ function mcmcchain2result(model, chain, ii=(:))
             if nt.observations[obs][key] isa Number
                 k = Symbol(obs, '_', key)
                 push!(key_mapping, k => [k])
-            elseif  nt.observations[obs][key] isa Tuple
+            elseif  nt.observations[obs][key] isa AbstractArray || nt.observations[obs][key] isa Tuple
                 arr = Symbol[]
                 push!(key_mapping, Symbol(obs, '_', key) => arr)
                 for i in eachindex(nt.observations[obs][key])
@@ -710,7 +709,7 @@ function mcmcchain2result(model, chain, ii=(:))
             if nt.planets[pl][key] isa Number
                 k = Symbol(pl, '_', key)
                 push!(key_mapping, k => [k])
-            elseif  nt.planets[pl][key] isa Tuple
+            elseif  nt.planets[pl][key] isa AbstractArray || nt.planets[pl][key] isa Tuple
                 arr = Symbol[]
                 push!(key_mapping, Symbol(pl, '_', key) => arr)
                 for i in eachindex(nt.planets[pl][key])
@@ -726,7 +725,7 @@ function mcmcchain2result(model, chain, ii=(:))
                 if nt.planets[pl].observations[obs][key] isa Number
                     k = Symbol(pl, '_', obs, '_', key)
                     push!(key_mapping, k => [k])
-                elseif  nt.planets[pl].observations[obs][key] isa Tuple
+                elseif  nt.planets[pl].observations[obs][key] isa AbstractArray || nt.planets[pl].observations[obs][key] isa Tuple
                     arr = Symbol[]
                     push!(key_mapping, Symbol(pl, '_', obs, '_', key) => arr)
                     for i in eachindex(nt.planets[pl].observations[obs][key])

@@ -25,6 +25,7 @@ octofit
 octofit_pigeons
 octofit_rejection
 initialize!
+startingpoints!
 Octofitter.savechain
 Octofitter.loadchain
 query_nss
@@ -35,4 +36,7 @@ completeness_jobs
 run_completeness_trial
 assemble_completeness
 completeness_map
+CompletenessJob
+CompletenessResult
+CompletenessMap
 ```

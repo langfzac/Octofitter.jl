@@ -70,6 +70,30 @@ function obmt2mjd(obmt::Float64)
 end
 
 # ──────────────────────────────────────────────────────────────────────
+# AGIS astrometric input spans
+# ──────────────────────────────────────────────────────────────────────
+#
+# Time spans of the *input data actually used* by each release's astrometric
+# solution (AGIS), as published in the release astrometry papers. These differ
+# from the nominal data-collection spans in `meta_gaia_DR2`/`meta_gaia_DR3`
+# above: both the DR2 and (E)DR3 solutions excluded the first month of the
+# operational phase (the ecliptic-pole scanning-law period, OBMT < 1192.13
+# rev), and the boundaries fall mid-day, not at midnight UTC.
+#   DR2:   OBMT 1192.13–3750.56 rev (Lindegren et al. 2018, Sect. 2)
+#   (E)DR3: OBMT 1192.13–5230.09 rev (Lindegren et al. 2021, Sect. 2)
+# Transits forecast outside these spans can never have contributed to the
+# corresponding astrometric solution, regardless of the matched-transit
+# counts reported in the source catalogs.
+const gaia_agis_span_dr2 = (;
+    start_mjd = obmt2mjd(1192.13), # 2014-08-22
+    stop_mjd  = obmt2mjd(3750.56), # 2016-05-23 ~11:35 UTC
+)
+const gaia_agis_span_dr3 = (;
+    start_mjd = obmt2mjd(1192.13), # 2014-08-22
+    stop_mjd  = obmt2mjd(5230.09), # 2017-05-28 ~08:45 UTC
+)
+
+# ──────────────────────────────────────────────────────────────────────
 # SPICE-based Earth ephemeris
 # ──────────────────────────────────────────────────────────────────────
 
@@ -633,7 +657,19 @@ function _simulate_skypath_hippacentre_combined!(
 
             ζ_k = two_π_over_s * ρ_pk
             f_k = flux_ratios[k] * α_k
-            sin_ζk, cos_ζk = sincos(ζ_k)
+            # A degenerate orbit proposal (e.g. an extreme sampler step) can
+            # make raoff/decoff — and hence ρ_pk and ζ_k — non-finite. Julia's
+            # `sincos` throws a DomainError on ±Inf/NaN, which would crash the
+            # whole evaluation. The host-reflex term below is already ±Inf for
+            # such a proposal, so the model is non-finite regardless; propagate
+            # NaN here instead of throwing so the sample is cleanly rejected
+            # (−Inf log-likelihood), mirroring the DR2/DR3 skypath path which
+            # never calls trig and just lets Inf flow downstream.
+            if isfinite(ζ_k)
+                sin_ζk, cos_ζk = sincos(ζ_k)
+            else
+                sin_ζk = cos_ζk = oftype(ζ_k, NaN)
+            end
             Re += f_k * cos_ζk
             Im += f_k * sin_ζk
             f_total += f_k

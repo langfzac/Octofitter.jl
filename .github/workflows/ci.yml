@@ -8,31 +8,56 @@ on:
   workflow_dispatch:
 jobs:
   test:
-    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.threads }} threads - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         version:
-          - '1.10' 
-          - '1' 
+          - '1.10'
+          - '1'
           - 'pre'
         os:
           - ubuntu-latest
         arch:
           - x64
+        threads:
+          - '1'
+        # One extra multithreaded job. `N,1` asks for N default-pool threads plus
+        # an interactive thread, which is what makes `Threads.maxthreadid()`
+        # exceed `Threads.nthreads()` -- the condition behind issue #129. The
+        # single-threaded matrix above cannot reach that state, so it could not
+        # have caught that bug.
+        include:
+          - version: '1'
+            os: ubuntu-latest
+            arch: x64
+            threads: '4,1'
     steps:
-      - uses: actions/checkout@v3
-      - uses: julia-actions/setup-julia@v2
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-      - uses: julia-actions/cache@v1
+      - uses: julia-actions/cache@v3
       - uses: julia-actions/julia-buildpkg@v1
+      # Fetch the network-backed DataDeps before the tests run, retrying with
+      # backoff. Without this, a single connect timeout to naif.jpl.nasa.gov
+      # errors the test job and reds the whole matrix -- see issue #128.
+      # Normally a no-op: DataDeps stores its downloads under the depot's
+      # `scratchspaces`, which julia-actions/cache already caches. This step is
+      # non-fatal by design; it never turns a network blip into a build failure.
+      - name: Pre-fetch DataDeps (with retry)
+        env:
+          DATADEPS_ALWAYS_ACCEPT: true
+        run: julia --project=. --color=yes .github/scripts/prefetch_datadeps.jl
       - uses: julia-actions/julia-runtest@v1
         env:
           DATADEPS_ALWAYS_ACCEPT: true
           GKSwstype: 100 # use software renderer for Plots.jl since headless
+          # Pkg.test spawns the test process with the parent's environment, so
+          # this reaches the tests themselves (verified locally on 1.11 and 1.12).
+          JULIA_NUM_THREADS: ${{ matrix.threads }}
       - uses: julia-actions/julia-processcoverage@v1
       - uses: codecov/codecov-action@v4
         with:
